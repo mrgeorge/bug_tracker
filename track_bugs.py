@@ -5,6 +5,7 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from scipy.spatial.distance import cdist
 import skimage.io
 from skimage.measure import label, regionprops_table
 
@@ -99,7 +100,7 @@ def detect_2d(
         width: int, frame width in pixels
         height: int, frame height in pixels
         save_bgsub: bool, flag to save background-subtracted frames
-        save_binamsk: bool, flag to save binary mask frames
+        save_binmask: bool, flag to save binary mask frames
         bg_skip_ticks: int, number of ticks to skip forward and backward for background subtraction (1 tick = 2 frames)
         detection_sigma: float, detection significance (# of stddev) for binary mask threshold
         cam{0,1}_{x,y}{min,max}: int, pixel coordinates to selection region of interest for analysis
@@ -182,7 +183,7 @@ def detect_2d(
             binmask_filename = Path(
                 output_dir, "frames/cam{}/binmask/{:04d}.png".format(cam, tick)
             )
-            plt.imsave(binamsk_filename, binary_mask, cmap="gray")
+            plt.imsave(binmask_filename, binary_mask, cmap="gray")
 
         print("{} {} {}".format(tick, cam, num_detections))
 
@@ -191,9 +192,83 @@ def detect_2d(
     ## Save detections
     det2d_filename = Path(output_dir, "detections_2d.csv")
     df = pd.DataFrame(detections)
+    df.index.name = "detection_id"
     df.to_csv(det2d_filename)
     print("Saved 2d detections to {}".format(det2d_filename))
     return det2d_filename
+
+
+def assign_bug_ids(det2d_filename, cam, max_distance=5):
+    """Assign bug IDs by comparing locations of detections across frames
+
+    Args:
+        det2d_filename: path to csv file with 2d detections (see detect_2d)
+        cam: int, camera ID
+        max_distance: float, max Euclidean distance in pixels (per tick) for matching detections
+
+    Returns:
+        csv filename where output detections with bug IDs for given camera are stored
+
+    TODO: Current approach looks for closest matching detections between adjacent
+        frames and restricts to matches within a given Euclidean distance threshold.
+        This could be improved by:
+        * allowing the search for matches over a flexible range of frames, to handle brief disappearances
+        * adding a velocity or direction term and forward-modeling to better handle intersections/occlusions
+        * joint search over 2d detections in both cameras, or 3d detections
+    """
+    df = pd.read_csv(det2d_filename, index_col=0)
+
+    df["bug_id"] = -1
+    df = df[df["cam"] == cam]
+    ticks = df["tick"].unique()
+    bug_id = 0
+    for tick in ticks:
+        curr_candidates = df[df["tick"] == tick]
+        if len(curr_candidates) == 0:
+            continue
+        if tick == min(ticks):
+            # initialize bug assignments on first tick
+            for idx, row in curr_candidates.iterrows():
+                df.loc[idx, "bug_id"] = bug_id
+                bug_id += 1
+        else:
+            # assign later ticks based on consistency with previous ticks
+            prev_candidates = df[(df["tick"] == tick - 1)]
+            if len(prev_candidates) == 0:
+                continue
+            # compute euclidian distance between each pair of coordinates
+            distances = cdist(
+                curr_candidates[["frame_x", "frame_y"]],
+                prev_candidates[["frame_x", "frame_y"]],
+            )
+            # for each of the prev candidates, choose the closest curr candidate
+            # within the distance threshold as a match, without duplicating already-assigned curr candidates
+            for prev in range(len(prev_candidates)):
+                if min(distances[:, prev]) < max_distance:
+                    curr = np.argmin(distances[:, prev])
+                    if prev_candidates.iloc[prev]["bug_id"] > 0:
+                        # assign curr bug_id to matching prev
+                        df.loc[
+                            curr_candidates.iloc[curr].name, "bug_id"
+                        ] = prev_candidates.iloc[prev]["bug_id"]
+                    else:
+                        # assign new bug_id to current and prev frame
+                        df.loc[curr_candidates.iloc[curr].name, "bug_id"] = bug_id
+                        df.loc[prev_candidates.iloc[prev].name, "bug_id"] = bug_id
+                        bug_id += 1
+
+                    # remove current candidate from remaining matching search
+                    curr_candidates = curr_candidates.drop(
+                        curr_candidates.iloc[curr].name
+                    )
+                    distances = np.delete(distances, curr, axis=0)
+                    if len(distances) == 0:
+                        break
+
+    output_filename = Path(det2d_filename).parent / "det2d_ids_cam{}.csv".format(cam)
+    df.to_csv(output_filename)
+    print("Saved bug IDs to {}".format(output_filename))
+    return output_filename
 
 
 def get_parser():
@@ -229,10 +304,17 @@ def get_parser():
     )
     parser.add_argument(
         "--detection_sigma",
-        type=int,
-        default=5,
+        type=float,
+        default=5.0,
         help="Detection significance (# of stddev) for binary mask threshold",
     )
+    parser.add_argument(
+        "--max_tracking_distance",
+        type=float,
+        default=5.0,
+        help="Max Euclidean distance in pixels (per tick) for detections to be tracked",
+    )
+
     return parser
 
 
@@ -264,4 +346,9 @@ if __name__ == "__main__":
         bg_skip_ticks=args.bg_skip_ticks,
         detection_sigma=args.detection_sigma,
         **roi_dict
+    )
+
+    # assign bug track IDs to cam 1 detections
+    bug_id_filename = assign_bug_ids(
+        det2d_filename, 1, max_distance=args.max_tracking_distance
     )
