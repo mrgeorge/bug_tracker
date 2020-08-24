@@ -2,6 +2,7 @@ import argparse
 import json
 from pathlib import Path
 
+import cv2
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -271,6 +272,89 @@ def assign_bug_ids(det2d_filename, cam, max_distance=5):
     return output_filename
 
 
+def get_homography(cam0_filename, cam1_filename):
+    """Detect Aruco markers in calibration frames and compute homography matrix
+
+    Args:
+        cam{0,1}_filename: filename for image with calibration frames for cam 0 and 1
+    Returns:
+        (3,3) float64 cv2 homography matrix
+        See map_points for usage
+    """
+
+    cam0 = skimage.io.imread(cam0_filename, as_gray=True)
+    cam1 = skimage.io.imread(cam1_filename, as_gray=True)
+
+    # Load the dictionary that was used to generate the markers.
+    dictionary = cv2.aruco.Dictionary_get(cv2.aruco.DICT_4X4_250)
+    # Initialize the detector parameters using default values
+    parameters = cv2.aruco.DetectorParameters_create()
+
+    # Detect the markers in the image
+    corners0, ids0, _ = cv2.aruco.detectMarkers(cam0, dictionary, parameters=parameters)
+    corners1, ids1, _ = cv2.aruco.detectMarkers(cam1, dictionary, parameters=parameters)
+    assert np.all(np.unique(ids0) == np.unique(ids1))
+    num_ids = len(ids0)
+
+    # reorder corners according to code IDs
+    corners0 = np.array(
+        [corners0[i] for i in [np.flatnonzero(ids0 == j)[0] for j in np.unique(ids0)]]
+    ).reshape(num_ids * 4, 2)
+    corners1 = np.array(
+        [corners1[i] for i in [np.flatnonzero(ids1 == j)[0] for j in np.unique(ids0)]]
+    ).reshape(num_ids * 4, 2)
+
+    # solve for homography to map cam0 coordinates to cam1 frame
+    homography, _ = cv2.findHomography(corners0, corners1)
+
+    return homography
+
+
+def map_points(homography, coords_src):
+    """Map points from coords_src to coords_dst using homography matrix
+
+    Args:
+        homography: (3, 3) cv2 homography matrix (see get_homography)
+        coords_src: (N, 2) array of coordinates in source frame
+    Returns:
+        coords_dst (N, 2) array of coordinates in destination frame
+    """
+    coords_src = cv2.convertPointsToHomogeneous(coords_src).squeeze()
+    coords_dst = np.dot(homography, coords_src.T).T
+    return cv2.convertPointsFromHomogeneous(coords_dst).squeeze()
+
+
+def project_detection_coords(det2d_filename, cam0_cal_filename, cam1_cal_filename):
+    """Convert detection coords from cam0, cam1 frames into shared cam1 frame
+
+    Args:
+        det2d_filename: path to 2d detections csv file
+        cam{0,1}_cal_filename: filename for image with calibration frames for cam 0 and 1
+    Returns:
+        csv filename with output projections saved
+    """
+    homography = get_homography(cam0_cal_filename, cam1_cal_filename)
+    df = pd.read_csv(det2d_filename, index_col=0)
+    # replicate cam1 coords from frame_x -> xp, frame_y -> yp
+    df.loc[df["cam"] == 1, "xp"] = df.loc[df["cam"] == 1, "frame_x"]
+    df.loc[df["cam"] == 1, "yp"] = df.loc[df["cam"] == 1, "frame_y"]
+
+    # project cam0 coords using homography
+    coords_dst = map_points(
+        homography, df.loc[df["cam"] == 0, ["frame_x", "frame_y"]].values
+    )
+    df.loc[df["cam"] == 0, "xp"] = coords_dst[:, 0]
+    df.loc[df["cam"] == 0, "yp"] = coords_dst[:, 1]
+
+    # save as ints to conform with rest of pixel coords
+    df[["xp", "yp"]] = df[["xp", "yp"]].astype(int)
+
+    output_filename = Path(det2d_filename).parent / "det2d_proj.csv"
+    df.to_csv(output_filename)
+    print("Saved projected coords to {}".format(output_filename))
+    return output_filename
+
+
 def get_parser():
     parser = argparse.ArgumentParser()
     parser.add_argument("input_filename", help="Input raw 2-cam video file")
@@ -314,6 +398,16 @@ def get_parser():
         default=5.0,
         help="Max Euclidean distance in pixels (per tick) for detections to be tracked",
     )
+    parser.add_argument(
+        "--cam0_cal_filename",
+        default="cal_cam0.png",
+        help="Calibration frame with Aruco markers for camera 0",
+    )
+    parser.add_argument(
+        "--cam1_cal_filename",
+        default="cal_cam1.png",
+        help="Calibration frame with Aruco markers for camera 1",
+    )
 
     return parser
 
@@ -349,6 +443,11 @@ if __name__ == "__main__":
     )
 
     # assign bug track IDs to cam 1 detections
-    bug_id_filename = assign_bug_ids(
+    cam1_bug_id_filename = assign_bug_ids(
         det2d_filename, 1, max_distance=args.max_tracking_distance
+    )
+
+    # map cam0 coords to cam1
+    projected_coords_filename = project_detection_coords(
+        det2d_filename, args.cam0_cal_filename, args.cam1_cal_filename
     )
