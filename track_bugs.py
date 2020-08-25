@@ -10,6 +10,8 @@ from scipy.spatial.distance import cdist
 import skimage.io
 from skimage.measure import label, regionprops_table
 
+pd.set_option("mode.chained_assignment", None)
+
 
 def read_frame(input_filename, width, height, frame_index):
     """Read frame from raw 2-cam uint8 video file and convert to float32
@@ -199,8 +201,8 @@ def detect_2d(
     return det2d_filename
 
 
-def assign_bug_ids(det2d_filename, cam, max_distance=5):
-    """Assign bug IDs by comparing locations of detections across frames
+def assign_track_ids(det2d_filename, cam, max_distance=5):
+    """Assign bug track IDs by comparing locations of detections across frames
 
     Args:
         det2d_filename: path to csv file with 2d detections (see detect_2d)
@@ -208,7 +210,7 @@ def assign_bug_ids(det2d_filename, cam, max_distance=5):
         max_distance: float, max Euclidean distance in pixels (per tick) for matching detections
 
     Returns:
-        csv filename where output detections with bug IDs for given camera are stored
+        csv filename where output detections with bug track IDs for given camera are stored
 
     TODO: Current approach looks for closest matching detections between adjacent
         frames and restricts to matches within a given Euclidean distance threshold.
@@ -266,13 +268,13 @@ def assign_bug_ids(det2d_filename, cam, max_distance=5):
                     if len(distances) == 0:
                         break
 
-    output_filename = Path(det2d_filename).parent / "det2d_ids_cam{}.csv".format(cam)
+    output_filename = Path(det2d_filename).parent / "tracks_2d_cam{}.csv".format(cam)
     df.to_csv(output_filename)
-    print("Saved bug IDs to {}".format(output_filename))
+    print("Saved bug track IDs to {}".format(output_filename))
     return output_filename
 
 
-def get_homography(cam0_filename, cam1_filename):
+def get_homography(cam0_cal_filename, cam1_cal_filename):
     """Detect Aruco markers in calibration frames and compute homography matrix
 
     Args:
@@ -282,8 +284,8 @@ def get_homography(cam0_filename, cam1_filename):
         See map_points for usage
     """
 
-    cam0 = skimage.io.imread(cam0_filename, as_gray=True)
-    cam1 = skimage.io.imread(cam1_filename, as_gray=True)
+    cam0 = skimage.io.imread(cam0_cal_filename, as_gray=True)
+    cam1 = skimage.io.imread(cam1_cal_filename, as_gray=True)
 
     # Load the dictionary that was used to generate the markers.
     dictionary = cv2.aruco.Dictionary_get(cv2.aruco.DICT_4X4_250)
@@ -349,9 +351,130 @@ def project_detection_coords(det2d_filename, cam0_cal_filename, cam1_cal_filenam
     # save as ints to conform with rest of pixel coords
     df[["xp", "yp"]] = df[["xp", "yp"]].astype(int)
 
-    output_filename = Path(det2d_filename).parent / "det2d_proj.csv"
+    output_filename = Path(det2d_filename).parent / "detections_proj.csv"
     df.to_csv(output_filename)
     print("Saved projected coords to {}".format(output_filename))
+    return output_filename
+
+
+def match_stereo_coords(projected_coords_filename, x_tol=12, y_tol=4, max_distance=1):
+    """Given detections in a shared projection, match detections and compute displacement
+
+    Args:
+        projected_coords_filename: csv filename with shared coordinate projection for 2 cams (see project_detection_coords)
+        {x,y}_tol: float, matching tolerance for determining stereo pairs
+    Returns:
+        csv filename with matched stereo coords and displacement
+    """
+    df = pd.read_csv(projected_coords_filename, index_col=0)
+    df0 = df[df["cam"] == 0]
+    df1 = df[df["cam"] == 1]
+
+    # hack: After projecting cam0 coords into cam1 with the homography,
+    #       ideally cam0 detections' yp values should match cam1 detections' yp values.
+    #       But in practice the region coordinates seem to be a closer match so
+    #       let's use those instead to determine detection pairs.
+    #       We'll use a similar matching approach as used in assign_track_ids/
+
+    # For each tick, find detections in cam0 with similar frame coords as detections in cam1
+    # Allow a wider tolerance in frame_x due to displacement
+    for tick in df1["tick"].unique():
+        c1_candidates = df1[df1["tick"] == tick]
+        c0_candidates = df0[df0["tick"] == tick]
+
+        if len(c0_candidates) == 0:
+            continue
+
+        # compute euclidian distance between each pair of coordinates, weighted by tolerance
+        distances = cdist(
+            c1_candidates[["region_x", "region_y"]],
+            c0_candidates[["region_x", "region_y"]],
+            lambda u, v: np.sqrt(
+                ((u[0] - v[0]) / x_tol) ** 2 + ((u[1] - v[1]) / y_tol) ** 2
+            ),
+        )
+        # for each of the c0 candidates, choose the closest c1 candidate
+        # within the distance threshold as a match, without duplicating already-assigned c1 candidates
+        for c0_idx in range(len(c0_candidates)):
+            if min(distances[:, c0_idx]) < max_distance:
+                c1_idx = np.argmin(distances[:, c0_idx])
+                df1.loc[
+                    c1_candidates.iloc[c1_idx].name, "cam0_detection_id"
+                ] = c0_candidates.iloc[c0_idx].name
+                df1.loc[c1_candidates.iloc[c1_idx].name, "displacement"] = (
+                    c0_candidates.iloc[c0_idx]["region_x"]
+                    - c1_candidates.iloc[c1_idx]["region_x"]
+                )
+
+                # remove c1 candidate from remaining matching search
+                c1_candidates = c1_candidates.drop(c1_candidates.iloc[c1_idx].name)
+                distances = np.delete(distances, c1_idx, axis=0)
+                if len(distances) == 0:
+                    break
+
+    output_filename = (
+        Path(projected_coords_filename).parent / "detections_stereo_matched.csv"
+    )
+    df1.to_csv(output_filename)
+    print("Saved stereo matched coords to {}".format(output_filename))
+    return output_filename
+
+
+def get_3d_tracks(stereo_coords_filename, tracks_filename):
+    """Merge stereo coords with bug track IDs into output file with 3d tracks
+
+    Args:
+        stereo_coords_filename: csv filename with matched stereo coords and displacement (see match_stereo_coords)
+        tracks_filename: csv filename with bug IDs (see assign_track_ids)
+    Returns:
+        csv filename with 3d tracks
+    """
+    df_stereo = pd.read_csv(
+        stereo_coords_filename,
+        usecols=[
+            "cam0_detection_id",
+            "detection_id",
+            "xp",
+            "yp",
+            "displacement",
+            "tick",
+        ],
+    )
+    df_stereo.rename(
+        columns={"detection_id": "cam1_detection_id", "xp": "x1", "yp": "y1"},
+        inplace=True,
+    )
+
+    df_tracks = pd.read_csv(
+        tracks_filename, usecols=["detection_id", "bug_id"], index_col=0
+    )
+
+    # join stereo coordinate table with bug track IDs
+    df_merged = pd.merge(
+        df_stereo, df_tracks, left_on="cam1_detection_id", right_on="detection_id"
+    )
+
+    df_merged = df_merged[
+        [
+            "tick",
+            "bug_id",
+            "x1",
+            "y1",
+            "displacement",
+            "cam0_detection_id",
+            "cam1_detection_id",
+        ]
+    ]
+    # remove detections only seen in cam1
+    df_merged = df_merged[~df_merged["displacement"].isnull()]
+
+    df_merged[["displacement", "cam0_detection_id"]] = df_merged[
+        ["displacement", "cam0_detection_id"]
+    ].astype(int)
+
+    output_filename = Path(stereo_coords_filename).parent / "bug_tracks.csv"
+    df_merged.to_csv(output_filename, index=False)
+    print("Bug tracks saved to {}".format(output_filename))
     return output_filename
 
 
@@ -443,7 +566,7 @@ if __name__ == "__main__":
     )
 
     # assign bug track IDs to cam 1 detections
-    cam1_bug_id_filename = assign_bug_ids(
+    tracks_filename = assign_track_ids(
         det2d_filename, 1, max_distance=args.max_tracking_distance
     )
 
@@ -451,3 +574,9 @@ if __name__ == "__main__":
     projected_coords_filename = project_detection_coords(
         det2d_filename, args.cam0_cal_filename, args.cam1_cal_filename
     )
+
+    # match projected stereo coords and compute displacement
+    stereo_coords_filename = match_stereo_coords(projected_coords_filename)
+
+    # join 3d coords to bug track IDs
+    tracks_3d_filename = get_3d_tracks(stereo_coords_filename, tracks_filename)
